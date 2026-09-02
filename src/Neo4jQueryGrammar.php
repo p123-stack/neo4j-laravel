@@ -19,14 +19,18 @@ use WikibaseSolutions\CypherDSL\Types\PropertyTypes\BooleanType;
  * Supported today (select path):
  *   - from() / table() -> MATCH (n:Label)
  *   - select(columns)  -> RETURN n.col, ...
- *   - where (Basic, Null, NotNull, In, NotIn, Between/NotBetween, Nested)
+ *   - where (Basic, Null, NotNull, In, NotIn, Between/NotBetween, Nested,
+ *            Column, raw, Date, Time, Day, Month, Year)
  *   - whereVectorSimilarTo -> CALL db.index.vector.queryNodes
+ *   - aggregates, exists()
+ *   - groupBy / having (basic)
  *   - orderBy -> ORDER BY
  *   - limit   -> LIMIT
  *   - offset  -> SKIP
+ *   - union / unionAll
  *   - insert   -> CREATE
- *   - update   -> MATCH / SET
- *   - delete   -> MATCH / DELETE
+ *   - update   -> MATCH / SET (including increment/decrement expressions)
+ *   - delete   -> MATCH / DETACH DELETE
  *
  * @psalm-suppress PropertyNotSetInConstructor
  */
@@ -60,61 +64,390 @@ final class Neo4jQueryGrammar extends Grammar
         return "(1.0 - vector.similarity.cosine({$property}, \$queryVector))";
     }
 
+    /**
+     * Wrap a column so increment/decrement and columnize emit Cypher properties.
+     *
+     * @param  \Illuminate\Contracts\Database\Query\Expression|string  $value
+     */
+    #[\Override]
+    public function wrap($value)
+    {
+        if ($this->isExpression($value)) {
+            return $this->getValue($value);
+        }
+
+        if (! is_string($value) || $value === '') {
+            return parent::wrap($value);
+        }
+
+        if ($value === '*') {
+            return '*';
+        }
+
+        return $this->compileColumn($value)->toQuery();
+    }
+
+    #[\Override]
+    protected function wrapValue($value)
+    {
+        if ($value === '*') {
+            return $value;
+        }
+
+        $this->assertIdentifier($value);
+
+        return $value;
+    }
+
     #[\Override]
     public function compileSelect(Builder $query): string
     {
         $this->parameterIndex = 0;
 
-        if ($this->hasVectorSimilarity($query)) {
-            return $this->compileVectorSelect($query);
-        }
-
-        $node = $this->compileNode($query->from);
-        $cypher = Query::new()->match($node);
-        $where = $this->compileWhereExpression($query->wheres ?? [], $node);
-
-        if ($where !== null) {
-            $cypher->where($where);
-        }
-
-        $cypher->returning($this->compileReturn($query, $node), (bool) $query->distinct);
-
-        $orders = $this->compileOrders($query, $query->orders ?? []);
-        if ($orders !== '') {
-            $cypher->raw('ORDER BY', substr($orders, strlen('ORDER BY ')));
-        }
-
-        if ($query->offset !== null) {
-            $cypher->skip((int) $query->offset);
-        }
-
-        if ($query->limit !== null) {
-            $cypher->limit((int) $query->limit);
-        }
-
-        return $cypher->build();
+        return $this->compileSelectBody($query);
     }
 
     /**
-     * @return Node|list<Property>
+     * Compile a select without resetting the shared parameter counter (unions).
      */
-    private function compileReturn(Builder $query, Node $node): Node|array
+    private function compileSelectBody(Builder $query): string
+    {
+        if ($this->hasVectorSimilarity($query)) {
+            if (! empty($query->unions) || ! empty($query->groups) || ! empty($query->havings) || $query->aggregate !== null) {
+                throw new RuntimeException('Vector similarity queries cannot be combined with union, groupBy, having, or aggregates.');
+            }
+
+            return $this->compileVectorSelect($query);
+        }
+
+        $sql = $this->compileMatchSelect($query);
+
+        if (! empty($query->unions)) {
+            foreach ($query->unions as $union) {
+                $conjunction = ! empty($union['all']) ? ' UNION ALL ' : ' UNION ';
+                $sql .= $conjunction.$this->compileMatchSelect($union['query']);
+            }
+
+            if (! empty($query->unionOrders)) {
+                $orders = $this->compileOrders($query, $query->unionOrders);
+                if ($orders !== '') {
+                    $sql .= ' '.$orders;
+                }
+            }
+
+            if (isset($query->unionOffset)) {
+                $sql .= ' SKIP '.(int) $query->unionOffset;
+            }
+
+            if (isset($query->unionLimit)) {
+                $sql .= ' LIMIT '.(int) $query->unionLimit;
+            }
+        }
+
+        return $sql;
+    }
+
+    private function compileMatchSelect(Builder $query): string
+    {
+        $node = $this->compileNode($query->from);
+        $prefix = Query::new()->match($node)->build();
+        $where = $this->compileWhereExpression($query->wheres ?? [], $node);
+
+        if ($where !== null) {
+            $prefix .= ' '.Query::new()->where($where)->build();
+        }
+
+        if ($query->aggregate !== null) {
+            return $this->compileAggregateSelect($query, $prefix, $node);
+        }
+
+        if (! empty($query->groups) || ! empty($query->havings)) {
+            return $this->compileGroupedSelect($query, $prefix, $node);
+        }
+
+        $cypher = $prefix.' RETURN '.$this->compileReturnClause($query, $node);
+
+        $orders = $this->compileOrders($query, $query->orders ?? []);
+        if ($orders !== '') {
+            $cypher .= ' '.$orders;
+        }
+
+        if ($query->offset !== null) {
+            $cypher .= ' SKIP '.(int) $query->offset;
+        }
+
+        if ($query->limit !== null) {
+            $cypher .= ' LIMIT '.(int) $query->limit;
+        }
+
+        return $cypher;
+    }
+
+    /**
+     * @param  array{function: string, columns: array<int, mixed>}  $aggregate
+     */
+    private function compileAggregateSelect(Builder $query, string $prefix, Node $node): string
+    {
+        $aggregate = $query->aggregate;
+        $function = strtolower((string) $aggregate['function']);
+        $this->assertIdentifier($function);
+
+        $argument = $this->compileAggregateArgument($function, $aggregate['columns'], (bool) $query->distinct);
+        $aggregateReturn = "{$function}({$argument}) AS aggregate";
+
+        if (! empty($query->groups) || ! empty($query->havings)) {
+            $withParts = $this->compileGroupExpressions($query, $node);
+            $withParts[] = $aggregateReturn;
+            $cypher = $prefix.' WITH '.implode(', ', $withParts);
+
+            if (! empty($query->havings)) {
+                $cypher .= ' WHERE '.$this->compileNeo4jHavings($query);
+            }
+
+            $returnParts = [];
+            foreach ($query->groups ?? [] as $group) {
+                $returnParts[] = $this->groupAlias($group);
+            }
+            $returnParts[] = 'aggregate';
+
+            return $cypher.' RETURN '.implode(', ', $returnParts);
+        }
+
+        return $prefix.' RETURN '.$aggregateReturn;
+    }
+
+    /**
+     * @param  array<int, mixed>  $columns
+     */
+    private function compileAggregateArgument(string $function, array $columns, bool $distinct): string
+    {
+        $column = $columns[0] ?? '*';
+
+        if ($this->isExpression($column)) {
+            $argument = $this->getValue($column);
+        } elseif ($column === '*' || $column === 'n.*') {
+            if ($function !== 'count') {
+                throw new RuntimeException("Aggregate {$function}() requires a column on Neo4j Query Builder.");
+            }
+            $argument = 'n';
+        } else {
+            $argument = $this->compileColumn((string) $column)->toQuery();
+        }
+
+        if ($distinct && $argument !== 'n') {
+            return 'DISTINCT '.$argument;
+        }
+
+        return $argument;
+    }
+
+    private function compileGroupedSelect(Builder $query, string $prefix, Node $node): string
+    {
+        $withParts = $this->compileGroupExpressions($query, $node);
+
+        foreach ($query->columns ?? [] as $column) {
+            if (! is_string($column) || $column === '*') {
+                continue;
+            }
+
+            $alias = $this->propertyName($column);
+            $alreadyGrouped = false;
+            foreach ($query->groups ?? [] as $group) {
+                if (! $this->isExpression($group) && $this->propertyName((string) $group) === $alias) {
+                    $alreadyGrouped = true;
+                    break;
+                }
+            }
+
+            if (! $alreadyGrouped) {
+                $withParts[] = $this->compileColumn($column, $node)->toQuery().' AS '.$alias;
+            }
+        }
+
+        if ($withParts === []) {
+            throw new RuntimeException('groupBy() requires at least one grouping column on Neo4j Query Builder.');
+        }
+
+        // Without an aggregate, DISTINCT is required so Cypher collapses rows like SQL GROUP BY.
+        $cypher = $prefix.' WITH DISTINCT '.implode(', ', $withParts);
+
+        if (! empty($query->havings)) {
+            $cypher .= ' WHERE '.$this->compileNeo4jHavings($query);
+        }
+
+        $returnParts = [];
+        foreach ($query->groups ?? [] as $group) {
+            $returnParts[] = $this->groupAlias($group);
+        }
+
+        foreach ($query->columns ?? [] as $column) {
+            if (! is_string($column) || $column === '*') {
+                continue;
+            }
+            $alias = $this->propertyName($column);
+            if (! in_array($alias, $returnParts, true)) {
+                $returnParts[] = $alias;
+            }
+        }
+
+        if ($returnParts === []) {
+            $returnParts = array_map(fn ($group) => $this->groupAlias($group), $query->groups ?? []);
+        }
+
+        $cypher .= ' RETURN '.implode(', ', $returnParts);
+
+        $orders = $this->compileOrders($query, $query->orders ?? []);
+        if ($orders !== '') {
+            $cypher .= ' '.$orders;
+        }
+
+        if ($query->offset !== null) {
+            $cypher .= ' SKIP '.(int) $query->offset;
+        }
+
+        if ($query->limit !== null) {
+            $cypher .= ' LIMIT '.(int) $query->limit;
+        }
+
+        return $cypher;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function compileGroupExpressions(Builder $query, Node $node): array
+    {
+        $parts = [];
+
+        foreach ($query->groups ?? [] as $group) {
+            if ($this->isExpression($group)) {
+                $parts[] = $this->getValue($group);
+
+                continue;
+            }
+
+            $property = $this->compileColumn((string) $group, $node)->toQuery();
+            $parts[] = $property.' AS '.$this->propertyName((string) $group);
+        }
+
+        return $parts;
+    }
+
+    private function groupAlias(mixed $group): string
+    {
+        if ($this->isExpression($group)) {
+            $value = trim($this->getValue($group));
+            if (preg_match('/\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$/i', $value, $matches) === 1) {
+                return $matches[1];
+            }
+
+            throw new RuntimeException('Raw groupBy expressions must end with AS alias for Neo4j Query Builder.');
+        }
+
+        return $this->propertyName((string) $group);
+    }
+
+    private function compileNeo4jHavings(Builder $query): string
+    {
+        $parts = [];
+
+        foreach ($query->havings ?? [] as $having) {
+            $boolean = strtolower((string) ($having['boolean'] ?? 'and'));
+            $compiled = $this->compileHaving($having);
+            $parts[] = ($parts === [] ? '' : strtoupper($boolean).' ').$compiled;
+        }
+
+        return implode(' ', $parts);
+    }
+
+    /**
+     * @param  array<string, mixed>  $having
+     */
+    #[\Override]
+    protected function compileHaving(array $having): string
+    {
+        return match ($having['type'] ?? null) {
+            'Raw' => (string) $having['sql'],
+            'Null' => $this->havingColumnName($having).' IS NULL',
+            'NotNull' => $this->havingColumnName($having).' IS NOT NULL',
+            'between' => $this->compileNeo4jHavingBetween($having),
+            'Nested' => '('.$this->compileNeo4jHavings($having['query']).')',
+            'Expression' => $this->getValue($having['column']),
+            default => $this->compileNeo4jBasicHaving($having),
+        };
+    }
+
+    /**
+     * @param  array<string, mixed>  $having
+     */
+    private function compileNeo4jBasicHaving(array $having): string
+    {
+        $column = $this->havingColumnName($having);
+        $operator = $this->normalizeComparisonOperator((string) $having['operator']);
+        $parameter = '$'.$this->nextParameterName();
+
+        return "{$column} {$operator} {$parameter}";
+    }
+
+    /**
+     * @param  array<string, mixed>  $having
+     */
+    private function compileNeo4jHavingBetween(array $having): string
+    {
+        $column = $this->havingColumnName($having);
+        $low = '$'.$this->nextParameterName();
+        $high = '$'.$this->nextParameterName();
+        $clause = "{$column} >= {$low} AND {$column} <= {$high}";
+
+        return ! empty($having['not']) ? "NOT ({$clause})" : $clause;
+    }
+
+    /**
+     * @param  array<string, mixed>  $having
+     */
+    private function havingColumnName(array $having): string
+    {
+        $column = $having['column'] ?? null;
+
+        if ($this->isExpression($column)) {
+            return $this->getValue($column);
+        }
+
+        $name = (string) $column;
+
+        if (str_contains($name, '.')) {
+            return $this->propertyName($name);
+        }
+
+        $this->assertIdentifier($name);
+
+        return $name;
+    }
+
+    private function compileReturnClause(Builder $query, Node $node): string
     {
         $columns = $query->columns ?? null;
+        $distinct = $query->distinct ? 'DISTINCT ' : '';
 
         if ($columns === null || $columns === [] || $columns === ['*']) {
-            return $node;
+            return $distinct.'n';
         }
 
         $parts = [];
         foreach ($columns as $column) {
-            if (! is_string($column) || $column === '*') {
-                return $node;
+            if ($this->isExpression($column)) {
+                $parts[] = $this->getValue($column);
+
+                continue;
             }
-            $parts[] = $this->compileColumn($column, $node);
+
+            if (! is_string($column) || $column === '*') {
+                return $distinct.'n';
+            }
+            $parts[] = $this->compileColumn($column, $node)->toQuery();
         }
 
-        return $parts;
+        return $distinct.implode(', ', $parts);
     }
 
     /**
@@ -129,7 +462,15 @@ final class Neo4jQueryGrammar extends Grammar
 
         $parts = [];
         foreach ($orders as $order) {
-            $column = $this->compileColumn((string) $order['column'])->toQuery();
+            if ($this->isExpression($order['column'] ?? null)) {
+                $column = $this->getValue($order['column']);
+            } else {
+                $columnName = (string) $order['column'];
+                // After WITH aliases (groupBy), order by the alias when present.
+                $column = ! empty($query->groups) && ! str_contains($columnName, '.')
+                    ? $this->propertyName($columnName)
+                    : $this->compileColumn($columnName)->toQuery();
+            }
             $direction = strtolower((string) ($order['direction'] ?? 'asc')) === 'desc' ? 'DESC' : 'ASC';
             $parts[] = "{$column} {$direction}";
         }
@@ -149,6 +490,26 @@ final class Neo4jQueryGrammar extends Grammar
         $expression = $this->compileWhereExpression($query->wheres, $this->compileNode($query->from));
 
         return $expression === null ? '' : Query::new()->where($expression)->build();
+    }
+
+    #[\Override]
+    public function compileExists(Builder $query): string
+    {
+        $this->parameterIndex = 0;
+
+        if ($this->hasVectorSimilarity($query)) {
+            throw new RuntimeException('exists() is not supported with whereVectorSimilarTo().');
+        }
+
+        $node = $this->compileNode($query->from);
+        $cypher = Query::new()->match($node)->build();
+        $where = $this->compileWhereExpression($query->wheres ?? [], $node);
+
+        if ($where !== null) {
+            $cypher .= ' '.Query::new()->where($where)->build();
+        }
+
+        return $cypher.' RETURN true AS exists LIMIT 1';
     }
 
     /**
@@ -190,6 +551,13 @@ final class Neo4jQueryGrammar extends Grammar
             'NotIn' => $this->compileInWhere($where, $node, true),
             'between' => $this->compileBetweenWhere($where, $node),
             'Nested' => $this->compileNestedWhere($where, $node),
+            'Column' => $this->compileColumnWhere($where, $node),
+            'raw', 'Raw' => $this->compileRawWhere($where),
+            'Date' => $this->compileDateWhere($where, $node, 'date'),
+            'Time' => $this->compileDateWhere($where, $node, 'time'),
+            'Day' => $this->compileDatePartWhere($where, $node, 'day'),
+            'Month' => $this->compileDatePartWhere($where, $node, 'month'),
+            'Year' => $this->compileDatePartWhere($where, $node, 'year'),
             'VectorSimilar' => throw new RuntimeException('whereVectorSimilarTo() cannot be nested inside MATCH WHERE; it replaces the scan with a vector index query.'),
             default => throw new RuntimeException("Unsupported where type for Neo4j Query Builder: {$type}"),
         };
@@ -216,6 +584,67 @@ final class Neo4jQueryGrammar extends Grammar
             'ENDS WITH' => $column->endsWith($param),
             '=~' => $column->regex($param),
         };
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    private function compileColumnWhere(array $where, Node $node): BooleanType
+    {
+        $first = $this->compileColumn((string) $where['first'], $node)->toQuery();
+        $second = $this->compileColumn((string) $where['second'], $node)->toQuery();
+        $operator = $this->normalizeComparisonOperator((string) $where['operator']);
+
+        return Query::rawExpression("{$first} {$operator} {$second}");
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    private function compileRawWhere(array $where): BooleanType
+    {
+        $sql = (string) $where['sql'];
+        $sql = preg_replace_callback('/\?/', function (): string {
+            return '$'.$this->nextParameterName();
+        }, $sql) ?? $sql;
+
+        return Query::rawExpression($sql);
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    private function compileDateWhere(array $where, Node $node, string $function): BooleanType
+    {
+        $column = $this->compileColumn((string) $where['column'], $node)->toQuery();
+        $operator = $this->normalizeComparisonOperator((string) $where['operator']);
+        $parameter = '$'.$this->nextParameterName();
+        $temporal = $this->temporalExpression($column);
+
+        if ($function === 'date') {
+            return Query::rawExpression("date({$temporal}) {$operator} date({$parameter})");
+        }
+
+        return Query::rawExpression("time({$temporal}) {$operator} time({$parameter})");
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    private function compileDatePartWhere(array $where, Node $node, string $part): BooleanType
+    {
+        $column = $this->compileColumn((string) $where['column'], $node)->toQuery();
+        $operator = $this->normalizeComparisonOperator((string) $where['operator']);
+        $parameter = '$'.$this->nextParameterName();
+        $temporal = $this->temporalExpression($column);
+
+        return Query::rawExpression("{$temporal}.{$part} {$operator} toInteger({$parameter})");
+    }
+
+    private function temporalExpression(string $column): string
+    {
+        // Accept Neo4j temporal values or Laravel-style "Y-m-d H:i:s" strings.
+        return "datetime(replace(toString({$column}), ' ', 'T'))";
     }
 
     /**
@@ -421,6 +850,23 @@ final class Neo4jQueryGrammar extends Grammar
         return $normalized;
     }
 
+    private function normalizeComparisonOperator(string $operator): string
+    {
+        $normalized = trim($operator);
+
+        if ($normalized === '!=') {
+            $normalized = '<>';
+        }
+
+        $allowed = ['=', '<>', '<', '<=', '>', '>='];
+
+        if (! in_array($normalized, $allowed, true)) {
+            throw new InvalidArgumentException("Unsupported comparison operator for Neo4j Query Builder: {$operator}");
+        }
+
+        return $normalized;
+    }
+
     private function compileNode(mixed $from): Node
     {
         if (! is_string($from) || $from === '') {
@@ -511,9 +957,14 @@ final class Neo4jQueryGrammar extends Grammar
         $node = $this->compileNode($query->from);
         $assignments = [];
 
-        foreach (array_keys($values) as $column) {
+        foreach ($values as $column => $value) {
             $property = $this->compileColumn((string) $column, $node)->toQuery();
-            $assignments[] = $property.' = $'.$this->nextParameterName();
+
+            if ($this->isExpression($value)) {
+                $assignments[] = $property.' = '.$this->getValue($value);
+            } else {
+                $assignments[] = $property.' = $'.$this->nextParameterName();
+            }
         }
 
         $cypher = Query::new()->match($node);
@@ -543,7 +994,7 @@ final class Neo4jQueryGrammar extends Grammar
             $prefix .= ' '.Query::new()->where($where)->build();
         }
 
-        return $prefix.' DELETE n';
+        return $prefix.' DETACH DELETE n';
     }
 
     /**

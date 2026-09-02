@@ -6,6 +6,13 @@ use Illuminate\Support\Str;
 
 /**
  * Configure a standard Eloquent model for Neo4j node persistence.
+ *
+ * Models keep a UUID property as the Eloquent primary key (`id` by default).
+ * When a full node is returned from Cypher, Neo4j's native element id is also
+ * hydrated onto the model and available via {@see elementId()}.
+ *
+ * Laravel's SoftDeletes trait works with Neo4j models: soft delete sets
+ * `deleted_at`, and force delete removes the node (DETACH DELETE).
  */
 trait HasNeo4jConnection
 {
@@ -25,6 +32,44 @@ trait HasNeo4jConnection
         $this->connection ??= 'neo4j';
         $this->incrementing = false;
         $this->keyType = 'string';
+    }
+
+    /**
+     * Neo4j element id for the matched node, when a full node was returned.
+     *
+     * Distinct from the Eloquent UUID primary key property (`id`).
+     */
+    public function elementId(): ?string
+    {
+        return isset($this->attributes['elementId'])
+            ? (string) $this->attributes['elementId']
+            : null;
+    }
+
+    /**
+     * Exclude Neo4j metadata from CREATE payloads.
+     *
+     * @return array<string, mixed>
+     */
+    protected function getAttributesForInsert()
+    {
+        $attributes = parent::getAttributesForInsert();
+        unset($attributes['elementId']);
+
+        return $attributes;
+    }
+
+    /**
+     * Exclude Neo4j metadata from SET payloads.
+     *
+     * @return array<string, mixed>
+     */
+    protected function getDirtyForUpdate()
+    {
+        $dirty = parent::getDirtyForUpdate();
+        unset($dirty['elementId']);
+
+        return $dirty;
     }
 
     /**

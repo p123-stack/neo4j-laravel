@@ -175,6 +175,21 @@ $user->update(['name' => 'Pratiksha Zalte']);
 $user->delete();
 ```
 
+When a full node is returned, Neo4j's native element id is hydrated onto the
+model (separate from the UUID primary key):
+
+```php
+$user = User::where('name', 'Pratiksha')->first();
+$user->id;          // UUID property used as Eloquent key
+$user->elementId(); // Neo4j element id, e.g. "4:xxx:123"
+```
+
+Laravel's `SoftDeletes` trait works on Neo4j models (`deleted_at` property,
+`withTrashed` / `restore` / `forceDelete`). Hard deletes use `DETACH DELETE`.
+
+Pagination APIs (`paginate`, `simplePaginate`, `cursorPaginate`) work via
+Cypher `SKIP` / `LIMIT` and aggregates for totals.
+
 For a dedicated graph model, the package also provides
 `Neo4j\Neo4jLaravel\Neo4jModel`, which already includes the concern.
 Graph relationship APIs are not part of the initial Eloquent integration.

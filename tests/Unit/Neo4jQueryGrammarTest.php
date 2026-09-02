@@ -171,7 +171,7 @@ final class Neo4jQueryGrammarTest extends TestCase
             ->where('id', 'user-1');
 
         self::assertSame(
-            'MATCH (n:User) WHERE (n.id = $p0) DELETE n',
+            'MATCH (n:User) WHERE (n.id = $p0) DETACH DELETE n',
             $grammar->compileDelete($builder)
         );
     }
@@ -217,6 +217,134 @@ final class Neo4jQueryGrammarTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
 
         $this->vectorBuilder()->from('Document')->whereVectorSimilarTo('embedding', 'find similar docs');
+    }
+
+    public function testCompilesCountAndExists(): void
+    {
+        $builder = $this->builder()->from('User')->where('active', true);
+        $builder->aggregate = ['function' => 'count', 'columns' => ['*']];
+
+        self::assertSame(
+            'MATCH (n:User) WHERE (n.active = $p0) RETURN count(n) AS aggregate',
+            $builder->toSql()
+        );
+
+        $exists = $this->builder()->from('User')->where('name', 'Pratiksha');
+        $grammar = new Neo4jQueryGrammar();
+
+        self::assertSame(
+            'MATCH (n:User) WHERE (n.name = $p0) RETURN true AS exists LIMIT 1',
+            $grammar->compileExists($exists)
+        );
+    }
+
+    public function testCompilesAggregatesSumAvgMinMax(): void
+    {
+        foreach (['sum', 'avg', 'min', 'max'] as $function) {
+            $builder = $this->builder()->from('User')->where('active', true);
+            $builder->aggregate = ['function' => $function, 'columns' => ['score']];
+
+            self::assertSame(
+                "MATCH (n:User) WHERE (n.active = \$p0) RETURN {$function}(n.score) AS aggregate",
+                $builder->toSql()
+            );
+        }
+    }
+
+    public function testPassesUnknownAggregatesThroughToCypher(): void
+    {
+        $builder = $this->builder()->from('User');
+        $builder->aggregate = ['function' => 'collect', 'columns' => ['name']];
+
+        self::assertSame(
+            'MATCH (n:User) RETURN collect(n.name) AS aggregate',
+            $builder->toSql()
+        );
+    }
+
+    public function testCompilesWhereColumnAndWhereRaw(): void
+    {
+        $builder = $this->builder()
+            ->from('User')
+            ->whereColumn('first_name', 'last_name')
+            ->whereRaw('n.age > ?', [21]);
+
+        self::assertSame(
+            'MATCH (n:User) WHERE (n.first_name = n.last_name AND n.age > $p0) RETURN n',
+            $builder->toSql()
+        );
+        self::assertSame([21], $builder->getBindings());
+    }
+
+    public function testCompilesDateWheres(): void
+    {
+        $builder = $this->builder()
+            ->from('User')
+            ->whereDate('created_at', '2026-08-31')
+            ->whereYear('created_at', 2026);
+
+        self::assertSame(
+            "MATCH (n:User) WHERE (date(datetime(replace(toString(n.created_at), ' ', 'T'))) = date(\$p0) "
+                ."AND datetime(replace(toString(n.created_at), ' ', 'T')).year = toInteger(\$p1)) RETURN n",
+            $builder->toSql()
+        );
+    }
+
+    public function testCompilesGroupByHaving(): void
+    {
+        $builder = $this->builder()
+            ->from('User')
+            ->select('status')
+            ->groupBy('status')
+            ->having('status', 'active');
+
+        self::assertSame(
+            'MATCH (n:User) WITH DISTINCT n.status AS status WHERE status = $p0 RETURN status',
+            $builder->toSql()
+        );
+    }
+
+    public function testCompilesAggregateWithGroupBy(): void
+    {
+        $builder = $this->builder()->from('User')->groupBy('status');
+        $builder->aggregate = ['function' => 'count', 'columns' => ['*']];
+
+        self::assertSame(
+            'MATCH (n:User) WITH n.status AS status, count(n) AS aggregate RETURN status, aggregate',
+            $builder->toSql()
+        );
+    }
+
+    public function testCompilesIncrementUpdateExpressions(): void
+    {
+        $grammar = new Neo4jQueryGrammar();
+        $builder = $this->builder()
+            ->from('User')
+            ->where('id', 'user-1');
+
+        $sql = $grammar->compileUpdate($builder, [
+            'votes' => new \Illuminate\Database\Query\Expression('n.votes + 1'),
+            'name' => 'Pratiksha',
+        ]);
+
+        self::assertSame(
+            'MATCH (n:User) WHERE (n.id = $p1) SET n.votes = n.votes + 1, n.name = $p0',
+            $sql
+        );
+    }
+
+    public function testCompilesUnionQueries(): void
+    {
+        $first = $this->builder()->from('User')->where('role', 'admin')->select('name');
+        $second = $this->builder()->from('User')->where('role', 'editor')->select('name');
+        $first->union($second);
+
+        self::assertSame(
+            'MATCH (n:User) WHERE (n.role = $p0) RETURN n.name '
+                .'UNION MATCH (n:User) WHERE (n.role = $p1) RETURN n.name',
+            $first->toSql()
+        );
+        self::assertSame(['admin', 'editor'], $first->getBindings());
     }
 
     private function vectorBuilder(): Neo4jQueryBuilder

@@ -11,9 +11,11 @@ use Laudis\Neo4j\Contracts\ClientInterface;
 use Laudis\Neo4j\Contracts\TransactionInterface;
 use Laudis\Neo4j\Contracts\UnmanagedTransactionInterface;
 use Laudis\Neo4j\Databags\SummarizedResult;
+use Laudis\Neo4j\Types\CypherMap;
 use Neo4j\Neo4jLaravel\Debug\CapturingUnmanagedTransaction;
 use Neo4j\Neo4jLaravel\Decorators\LaravelNeo4jClient;
 use PDO;
+
 
 /**
  * @psalm-suppress PropertyNotSetInConstructor
@@ -230,6 +232,10 @@ final class Neo4jConnection extends Connection
 
     /**
      * Run a select statement against the database.
+     *
+     * Returns an array of stdClass rows, matching Laravel SQL drivers
+     * (PDO::FETCH_OBJ), so Query Builder methods like exists() that cast
+     * rows to arrays work without Neo4j-specific overrides.
      */
     #[\Override]
     public function select($query, $bindings = [], $useReadPdo = true): array
@@ -237,10 +243,35 @@ final class Neo4jConnection extends Connection
         $result = $this->read($query, $this->prepareBindings($bindings));
 
         if ($result instanceof SummarizedResult) {
-            return $result->list();
+            $rows = $result->list();
+        } else {
+            $rows = is_array($result) ? $result : [$result];
         }
 
-        return is_array($result) ? $result : [$result];
+        return array_map($this->mapSelectRow(...), $rows);
+    }
+
+    /**
+     * Convert a Neo4j record into a stdClass row like PDO::FETCH_OBJ.
+     *
+     * Nested Neo4j values (nodes, lists, maps) are left intact so
+     * Neo4jProcessor can flatten them for Eloquent hydration.
+     */
+    private function mapSelectRow(mixed $row): mixed
+    {
+        if ($row instanceof CypherMap) {
+            return (object) $row->toArray();
+        }
+
+        if (is_object($row)) {
+            return $row;
+        }
+
+        if (is_array($row)) {
+            return (object) $row;
+        }
+
+        return $row;
     }
 
     /**
